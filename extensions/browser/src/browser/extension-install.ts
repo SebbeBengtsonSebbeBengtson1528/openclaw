@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { replaceFileAtomic } from "openclaw/plugin-sdk/security-runtime";
 import { resolveStateDir } from "openclaw/plugin-sdk/state-paths";
 import {
   chromeStoreInstallRequests,
@@ -373,9 +374,7 @@ async function installRegistration(params: {
       throw new Error(`Refusing to overwrite foreign native host launcher: ${launcherPath}`);
     }
     if (existingLauncher !== launcher.content) {
-      const replacement = `${launcherPath}.tmp-${process.pid}`;
-      await fs.writeFile(replacement, launcher.content, { mode: 0o700, flag: "wx" });
-      await fs.rename(replacement, launcherPath);
+      await replaceFileAtomic({ filePath: launcherPath, content: launcher.content, mode: 0o700 });
     }
   } else {
     await fs.writeFile(launcherPath, launcher.content, { mode: 0o700, flag: "wx" });
@@ -390,15 +389,11 @@ async function installRegistration(params: {
     type: "stdio",
     allowed_origins: expectedOriginsForExtensionIds(extensionIds),
   };
-  const temporary = `${manifestPath}.tmp-${process.pid}-${crypto.randomBytes(4).toString("hex")}`;
-  await fs.writeFile(temporary, `${JSON.stringify(manifest, null, 2)}\n`, {
+  await replaceFileAtomic({
+    filePath: manifestPath,
+    content: `${JSON.stringify(manifest, null, 2)}\n`,
     mode: 0o600,
-    flag: "wx",
   });
-  await fs.rename(temporary, manifestPath);
-  if (process.platform !== "win32") {
-    await fs.chmod(manifestPath, 0o600);
-  }
   return await inspectRegistration(root, deps, extensionIds);
 }
 
@@ -659,79 +654,4 @@ export async function resolveChromeExtensionLoadPath(
   const bundledPath = await fs.realpath(path.resolve(bundledDir));
   await assertOwnedPath(bundledPath, "directory", { allowRootOwner: true });
   return bundledPath;
-}
-
-/** Repair drift only when both the copy and existing registration are already owned. */
-export async function repairOwnedChromeExtensionNativeHosts(params: {
-  bundledDir: string;
-  pluginRoot: string;
-  deps?: ExtensionInstallDeps;
-}): Promise<{ changes: string[]; warnings: string[] }> {
-  const deps = params.deps ?? {};
-  if ((deps.platform ?? process.platform) === "win32") {
-    return { changes: [], warnings: [] };
-  }
-  const before = await browserExtensionStatus({ bundledDir: params.bundledDir, deps });
-  if (
-    !before.installedCopy.owned ||
-    (before.discovered.length === 0 && before.storeDiscovered.length === 0)
-  ) {
-    return { changes: [], warnings: [] };
-  }
-  const changes: string[] = [];
-  const warnings: string[] = [];
-  const predictedIds = before.approvedPaths
-    .map((candidate) =>
-      generateChromeExtensionIdForPath(candidate, deps.platform ?? process.platform),
-    )
-    .toSorted();
-  for (const root of chromeProductRoots(deps)) {
-    const manifestPath = path.join(root.nativeManifestDir, `${BROWSER_NATIVE_HOST_NAME}.json`);
-    const registration = await inspectRegistration(root, deps);
-    const productWasDiscovered =
-      before.discovered.some((entry) => entry.product === root.product) ||
-      before.storeDiscovered.some((entry) => entry.product === root.product);
-    if (!productWasDiscovered) {
-      continue;
-    }
-    if (registration?.state === "foreign" || registration?.state === "invalid") {
-      warnings.push(
-        `${root.label} native host repair refused: ${registration.issue ?? registration.state}`,
-      );
-      continue;
-    }
-    if (registration?.state !== "owned") {
-      continue;
-    }
-    try {
-      const idsAreCurrent =
-        JSON.stringify(registration.extensionIds) ===
-        JSON.stringify(expectedExtensionIds(predictedIds));
-      if (!idsAreCurrent && !isSafeOriginMigration(registration.extensionIds, predictedIds)) {
-        warnings.push(`${root.label} native host repair refused: unexpected allowed origins`);
-        continue;
-      }
-      const launcher = await resolveLauncherInstall({
-        manifestPath,
-        pluginRoot: params.pluginRoot,
-        extensionIds: predictedIds,
-        deps,
-      });
-      await assertOwnedPath(launcher.path, "file");
-      const launcherIsCurrent = (await fs.readFile(launcher.path, "utf8")) === launcher.content;
-      if (idsAreCurrent && launcherIsCurrent) {
-        continue;
-      }
-      await installRegistration({
-        root,
-        extensionIds: predictedIds,
-        pluginRoot: params.pluginRoot,
-        deps,
-      });
-      changes.push(`Repaired ${root.label} OpenClaw native messaging registration.`);
-    } catch (error) {
-      warnings.push(`${root.label} native host repair failed: ${String(error)}`);
-    }
-  }
-  return { changes, warnings };
 }
